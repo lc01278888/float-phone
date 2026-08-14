@@ -1153,8 +1153,8 @@ export function parseMomentPostResponse(rawText: string): {
     const blockMatch = rawText.match(/\[朋友圈\]\s*([\s\S]*?)\s*\[\/朋友圈\]/);
     const text = blockMatch ? blockMatch[1] : rawText;
 
-    const explicitPhotoMatch = text.match(/\[照片[:：]\s*(使用参考图|不使用参考图)\s*[:：]\s*([\s\S]*?)\]/);
-    const legacyPhotoMatch = explicitPhotoMatch ? null : text.match(/\[照片[:：]\s*([\s\S]*?)\]/);
+    const explicitPhotoMatch = rawText.match(/\[照片[:：]\s*(使用参考图|不使用参考图)\s*[:：]\s*([\s\S]*?)\]/);
+    const legacyPhotoMatch = explicitPhotoMatch ? null : rawText.match(/\[照片[:：]\s*([\s\S]*?)\]/);
     const photoDescription = explicitPhotoMatch
         ? explicitPhotoMatch[2].trim()
         : legacyPhotoMatch ? legacyPhotoMatch[1].trim() : undefined;
