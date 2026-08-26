@@ -22,7 +22,10 @@ import {
     toolNameMatches,
 } from "./tool-storage";
 import { executeCustomAppToolCall } from "./custom-app-tool-runtime";
-import { CALENDAR_MANAGEMENT_CAPABILITY_ID, LOCAL_DATA_LIBRARY_CAPABILITY_ID, MEMORY_WRITE_CAPABILITY_ID, MUSIC_CONTROL_CAPABILITY_ID, NOTE_WALL_CAPABILITY_ID, SEND_FILE_CAPABILITY_ID, TIMED_WAKE_CAPABILITY_ID, TOOLBOX_MANAGEMENT_CAPABILITY_ID, getInternalCapability } from "./internal-capability-storage";
+import { characterWorkspace, agentComputerRequest, isAgentComputerConfigured } from "./agent-computer";
+import { AGENT_COMPUTER_CAPABILITY_ID, CALENDAR_MANAGEMENT_CAPABILITY_ID, LOCAL_DATA_LIBRARY_CAPABILITY_ID, MEMORY_WRITE_CAPABILITY_ID, MUSIC_CONTROL_CAPABILITY_ID, NOTE_WALL_CAPABILITY_ID, REALITY_BRIDGE_CAPABILITY_ID, SEND_FILE_CAPABILITY_ID, TIMED_WAKE_CAPABILITY_ID, TOOLBOX_MANAGEMENT_CAPABILITY_ID, getInternalCapability } from "./internal-capability-storage";
+import { bridgeConnection, loadBridgeDataItems, loadBridgeShortcutActions, readAllBridgeStateSnapshots, readBridgeStateSnapshot } from "./reality-bridge/storage";
+import { createShortcutCommand, deliverShortcutCommand, waitForShortcutCommand } from "./shortcut-command-client";
 import { loadMemoryEntriesByType, saveMemoryEntry } from "./memory-storage";
 import type { MemoryEntry } from "./memory-types";
 import { loadCharacters } from "./character-storage";
@@ -71,6 +74,10 @@ import {
 import { makeTimedWakeId, saveTimedWakeSchedule } from "./timed-wake-storage";
 import { resolveUserIdentity } from "./settings-storage";
 import { attachAbortSignal, isAbortError, throwIfAborted } from "./abort-utils";
+import {
+    deleteShortcutCommandMediaUrl,
+    registerShortcutCommandMediaCleanup,
+} from "./shortcut-command-media-client";
 
 // ── Types ─────────────────────────────────────
 
@@ -89,6 +96,12 @@ export type ToolExecutionContext = {
     characterId?: string;
     sourceEngine?: "chat" | "group_chat" | "custom_app";
     signal?: AbortSignal;
+    onShortcutCommandCreated?: (command: {
+        id: string;
+        actionName: string;
+        resultMode: "none" | "text" | "image";
+        expiresAt: string;
+    }) => Promise<boolean>;
 };
 
 function isSupportedChatToolContext(
@@ -221,6 +234,35 @@ async function proxyFetch(
     } finally {
         if (timeoutId) clearTimeout(timeoutId);
     }
+}
+
+// 直连模式：浏览器直接请求 MCP（本机/局域网地址服务端代理天然不可达且被 SSRF 防线拦截）。
+// 需要 MCP 服务器允许 CORS；仅支持 Streamable HTTP（POST）。
+async function directMcpFetch(
+    url: string,
+    options: { headers?: Record<string, string>; body?: unknown; signal?: AbortSignal },
+): Promise<{ status: number; text: string; headers: Record<string, string> }> {
+    throwIfAborted(options.signal);
+    let res: Response;
+    try {
+        res = await fetch(url, {
+            method: "POST",
+            headers: options.headers,
+            body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+            signal: options.signal,
+        });
+    } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") throw err;
+        throw new Error("直连请求失败：无法连接 MCP 服务器，或被浏览器 CORS 拦截。"
+            + "请确认服务器已启动、地址端口正确，且允许了跨域（Access-Control-Allow-Origin）。");
+    }
+    const text = await res.text();
+    const headers: Record<string, string> = {};
+    const sessionId = res.headers.get("mcp-session-id");
+    if (sessionId) headers["mcp-session-id"] = sessionId;
+    const wwwAuth = res.headers.get("www-authenticate");
+    if (wwwAuth) headers["www-authenticate"] = wwwAuth;
+    return { status: res.status, text, headers };
 }
 
 function truncate(text: string): string {
@@ -747,6 +789,8 @@ async function executeInternalTool(call: ToolCall, context?: ToolExecutionContex
     if (isLocalDataToolName(call.name)) return executeLocalDataTool(call);
     if (isToolboxManagementToolName(call.name)) return executeToolboxManagementTool(call);
     if (call.name === "发送文件") return executeSendFileTool(call);
+    if (call.name === "角色电脑") return executeAgentComputerTool(call, context);
+    if (isRealityBridgeToolName(call.name)) return executeRealityBridgeTool(call, context);
     if (call.name === "稍后主动联系" || call.name === "设置定时醒来") return executeTimedWakeTool(call, context);
 
     if (call.name !== "写入记忆") return null;
@@ -764,6 +808,202 @@ async function executeInternalTool(call: ToolCall, context?: ToolExecutionContex
     }
 
     return executeMemoryWriteTool(call.args, capability, context);
+}
+
+function isRealityBridgeToolName(name: string): boolean {
+    return name === "查看全部手机数据"
+        || loadBridgeShortcutActions().some(item => item.enabled && item.name === name)
+        || loadBridgeDataItems().some(item => item.name === name);
+}
+
+function formatSnapshotAge(iso?: string): string {
+    if (!iso) return "";
+    const ms = Date.now() - new Date(iso).getTime();
+    if (!Number.isFinite(ms) || ms < 0) return "";
+    const min = Math.round(ms / 60_000);
+    const label = min < 1 ? "刚刚"
+        : min < 60 ? `${min} 分钟前`
+        : min < 1440 ? `${Math.round(min / 60)} 小时前`
+        : `${Math.round(min / 1440)} 天前`;
+    return `（更新于${label}）`;
+}
+
+function shortcutResultText(value: unknown): string {
+    if (typeof value === "string") return value.trim();
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+        const record = value as Record<string, unknown>;
+        const text = record.text ?? record.message ?? record.value;
+        if (typeof text === "string" && text.trim()) return text.trim();
+    }
+    try {
+        return JSON.stringify(value ?? {});
+    } catch {
+        return String(value ?? "");
+    }
+}
+
+async function shortcutResultMedia(
+    value: unknown,
+    commandId: string,
+    retainRemote = false,
+): Promise<MediaAttachment[] | undefined> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const record = value as Record<string, unknown>;
+    const rawUrl = record.mediaUrl ?? record.imageUrl ?? record.url;
+    const url = typeof rawUrl === "string" ? rawUrl.trim() : "";
+    if (!/^https?:\/\//i.test(url)) return undefined;
+    const rawType = String(record.mediaType ?? record.type ?? "image").toLowerCase();
+    const type: MediaAttachment["type"] = rawType === "audio" || rawType === "video" || rawType === "file" ? rawType : "image";
+    const managedImage = type === "image" && typeof record.storagePath === "string" && record.storagePath.length > 0;
+    let attachmentUrl = url;
+    try {
+        if (managedImage) {
+            const response = await fetch(url, { cache: "no-store" });
+            if (response.ok) {
+                const blob = await response.blob();
+                const mime = response.headers.get("content-type") || blob.type || "image/jpeg";
+                if (!mime.toLowerCase().startsWith("image/") || blob.size === 0) {
+                    throw new Error("图片响应内容无效。");
+                }
+                attachmentUrl = await storeMediaBlob(blob, mime, type);
+                if (retainRemote) registerShortcutCommandMediaCleanup(commandId, url);
+                else deleteShortcutCommandMediaUrl(url);
+            } else {
+                throw new Error(`图片下载返回 ${response.status}。`);
+            }
+        }
+    } catch (error) {
+        if (managedImage) {
+            const detail = error instanceof Error ? error.message : String(error);
+            throw new Error(`快捷指令图片读取失败：${detail}`);
+        }
+    }
+    return [{ type, url: attachmentUrl, title: typeof record.title === "string" ? record.title.slice(0, 120) : undefined }];
+}
+
+async function executeRealityBridgeTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
+    const capability = getInternalCapability(REALITY_BRIDGE_CAPABILITY_ID);
+    if (!capability || !capability.enabled || capability.mode === "off") {
+        return { name: call.name, success: false, error: "「现实桥」能力未启用（工具箱 → 内置能力）" };
+    }
+
+    const shortcutAction = loadBridgeShortcutActions().find(item => item.enabled && item.name === call.name);
+    if (shortcutAction) {
+        try {
+            const created = await createShortcutCommand(
+                shortcutAction,
+                call.args || {},
+                context?.signal,
+                { deferDelivery: shortcutAction.resultMode !== "none" && Boolean(context?.onShortcutCommandCreated) },
+            );
+            if (shortcutAction.resultMode === "none") {
+                if (!created.delivered) {
+                    return {
+                        name: call.name,
+                        success: false,
+                        error: shortcutAction.deliveryMode === "email"
+                            ? "快捷动作邮件未能送达。"
+                            : "当前账号没有可用的 Web Push 订阅，无法启动 iPhone 快捷指令。",
+                        userNotice: "快捷动作未送达 iPhone",
+                    };
+                }
+                return {
+                    name: call.name,
+                    success: true,
+                    data: shortcutAction.deliveryMode === "email"
+                        ? `已发送“${shortcutAction.shortcutName}”自动化触发邮件（命令 ${created.command.id}）。`
+                        : `已向 iPhone 发送“${shortcutAction.shortcutName}”运行通知，等待用户点击执行（命令 ${created.command.id}）。`,
+                    userNotice: shortcutAction.deliveryMode === "email"
+                        ? `已发送「${shortcutAction.name}」触发邮件`
+                        : `已发送「${shortcutAction.name}」到 iPhone`,
+                };
+            }
+
+            let continuationArmed = false;
+            try {
+                continuationArmed = await context?.onShortcutCommandCreated?.({
+                    id: created.command.id,
+                    actionName: shortcutAction.name,
+                    resultMode: shortcutAction.resultMode,
+                    expiresAt: created.command.expiresAt,
+                }) ?? false;
+            } catch (err) {
+                console.warn("[RealityBridge] shortcut continuation arm failed:", err);
+            }
+
+            const delivery = created.deferred
+                ? await deliverShortcutCommand(created.command.id, context?.signal)
+                : created;
+            if (!delivery.delivered) {
+                return {
+                    name: call.name,
+                    success: false,
+                    error: shortcutAction.deliveryMode === "email"
+                        ? "快捷动作邮件未能送达。"
+                        : "当前账号没有可用的 Web Push 订阅，无法启动 iPhone 快捷指令。",
+                    userNotice: "快捷动作未送达 iPhone",
+                };
+            }
+
+            const completed = await waitForShortcutCommand(created.command.id, created.command.expiresAt, context?.signal);
+            if (completed.status !== "succeeded") {
+                const reason = completed.error || (completed.status === "expired" ? "等待手机执行超时" : `命令状态：${completed.status}`);
+                return { name: call.name, success: false, error: reason, userNotice: `「${shortcutAction.name}」未完成` };
+            }
+            const text = shortcutResultText(completed.result) || "快捷指令已执行成功。";
+            return {
+                name: call.name,
+                success: true,
+                data: text.slice(0, 2000),
+                mediaAttachments: await shortcutResultMedia(completed.result, completed.id, continuationArmed),
+                userNotice: `「${shortcutAction.name}」已完成`,
+            };
+        } catch (err) {
+            if (isAbortError(err)) throw err;
+            return { name: call.name, success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+
+    const { config, ready } = bridgeConnection();
+    if (!ready) {
+        return { name: call.name, success: false, error: "现实桥未连接（需要先在数据管理里配置云端备份的 Supabase）" };
+    }
+
+    if (call.name === "查看全部手机数据") {
+        try {
+            const snapshots = await readAllBridgeStateSnapshots(config);
+            if (snapshots.length === 0) {
+                return { name: call.name, success: true, data: "手机还没有上传过任何状态快照（需要先配置上传快捷指令）" };
+            }
+            const items = loadBridgeDataItems();
+            const lines = snapshots.map(snapshot => {
+                const item = items.find(entry => entry.key === snapshot.key);
+                return `【${item?.name || snapshot.key}】${snapshot.text}${formatSnapshotAge(snapshot.updatedAt)}`;
+            });
+            return { name: call.name, success: true, data: lines.join("\n") };
+        } catch (err) {
+            return { name: call.name, success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+
+    // 用户自定义数据项：按工具名找到对应快照读取
+    const item = loadBridgeDataItems().find(entry => entry.name === call.name);
+    if (!item) {
+        return { name: call.name, success: false, error: "未找到该数据项（可能已被删除）" };
+    }
+    try {
+        const snapshot = await readBridgeStateSnapshot(config, item.key);
+        if (!snapshot) {
+            return {
+                name: call.name,
+                success: true,
+                data: `「${item.name}」还没有数据：手机尚未上传过 ${item.key}.json（请检查对应的上传快捷指令是否已配置并运行过）`,
+            };
+        }
+        return { name: call.name, success: true, data: `${snapshot.text}${formatSnapshotAge(snapshot.updatedAt)}` };
+    } catch (err) {
+        return { name: call.name, success: false, error: err instanceof Error ? err.message : String(err) };
+    }
 }
 
 function isNoteWallToolName(name: string): boolean {
@@ -1924,6 +2164,112 @@ function dispatchCalendarUpdated(): void {
     }
 }
 
+// ── 角色电脑（角色自己的云端小电脑）───────────────
+
+function agentComputerMimeFor(path: string): string {
+    const ext = path.split(".").pop()?.toLowerCase() || "";
+    const map: Record<string, string> = {
+        png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp",
+        mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4",
+        mp4: "video/mp4", webm: "video/webm",
+        txt: "text/plain", md: "text/markdown", json: "application/json", html: "text/html",
+    };
+    return map[ext] || "application/octet-stream";
+}
+
+async function executeAgentComputerTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
+    const failed = (error: string, userNotice?: string): ToolResult => ({
+        name: call.name, success: false, error, continueConversation: false, persistToHistory: false, userNotice,
+    });
+    const capability = getInternalCapability(AGENT_COMPUTER_CAPABILITY_ID);
+    if (!capability || !capability.enabled || capability.mode === "off") return failed("角色电脑能力未启用");
+    if (!isAgentComputerConfigured()) return failed("角色电脑尚未连接（设置 → 角色电脑）");
+    if (!isSupportedChatToolContext(context)) return failed("当前场景暂不支持角色电脑");
+
+    const workspace = characterWorkspace(context.characterId);
+    const args = call.args || {};
+    const op = String(args.op ?? "").trim();
+    const path = String(args.path ?? "").trim();
+    const baseName = path.split("/").pop() || path;
+
+    try {
+        if (op === "write") {
+            const content = String(args.content ?? "");
+            if (!path) return failed("缺少 path");
+            if (!content) return failed("缺少 content");
+            await agentComputerRequest("write", workspace, { path, content });
+            return {
+                name: call.name, success: true,
+                data: `已写入自己电脑：${path}（${content.length} 字符）`,
+                continueConversation: true, persistToHistory: false,
+                userNotice: `📂 在自己的电脑上写下了《${baseName}》`,
+            };
+        }
+        if (op === "read") {
+            if (!path) return failed("缺少 path");
+            const data = await agentComputerRequest<{ content: string; truncated: boolean }>("read", workspace, { path, maxChars: 20000 });
+            return {
+                name: call.name, success: true,
+                data: `${path} 的内容：\n${data.content}${data.truncated ? "\n…（已截断）" : ""}`,
+                continueConversation: true, persistToHistory: false,
+            };
+        }
+        if (op === "list") {
+            const data = await agentComputerRequest<{ entries: Array<{ name: string; dir: boolean }> }>("list", workspace, { path: path || "/" });
+            const listing = data.entries.length
+                ? data.entries.map(entry => `${entry.dir ? "[目录]" : "[文件]"} ${entry.name}`).join("\n")
+                : "（空目录）";
+            return {
+                name: call.name, success: true,
+                data: `${path || "/"} 下：\n${listing}`,
+                continueConversation: true, persistToHistory: false,
+            };
+        }
+        if (op === "send") {
+            if (!path) return failed("缺少 path");
+            const data = await agentComputerRequest<{ base64: string }>("read_base64", workspace, { path });
+            const mime = agentComputerMimeFor(path);
+            const bytes = Uint8Array.from(atob(data.base64), c => c.charCodeAt(0));
+            const type = inferMediaAttachmentType(path, baseName);
+            const url = await storeMediaBlob(new Blob([bytes], { type: mime }), mime, type);
+            return {
+                name: call.name, success: true,
+                data: `文件已发送：${baseName}`,
+                continueConversation: true, persistToHistory: false,
+                mediaAttachments: [{ type, url, title: baseName }],
+            };
+        }
+        if (op === "exec") {
+            const command = String(args.command ?? "").trim();
+            if (!command) return failed("缺少 command");
+            try {
+                const data = await agentComputerRequest<{ exitCode: number; stdout: string; stderr: string }>(
+                    "exec", workspace, { command });
+                const parts = [`$ ${command}`, `退出码：${data.exitCode}`];
+                if (data.stdout) parts.push(`stdout：\n${data.stdout}`);
+                if (data.stderr) parts.push(`stderr：\n${data.stderr}`);
+                if (!data.stdout && !data.stderr) parts.push("（无输出）");
+                return {
+                    name: call.name, success: true,
+                    data: parts.join("\n"),
+                    continueConversation: true, persistToHistory: false,
+                    userNotice: `💻 在自己的电脑上运行了一条命令`,
+                };
+            } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                if (/shell 不可用|execution backend/i.test(message)) {
+                    return failed("这台电脑是基础模式（没有 shell），改用 write / read / list 完成吧");
+                }
+                throw err;
+            }
+        }
+        return failed("op 需为 write / read / list / send / exec 之一");
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return failed(`角色电脑操作失败：${message}`);
+    }
+}
+
 // ── Send File Tool ───────────────────────────────
 
 async function executeSendFileTool(call: ToolCall): Promise<ToolResult> {
@@ -2658,7 +3004,7 @@ async function executeTimedWakeTool(call: ToolCall, context?: ToolExecutionConte
 
     const delayMinutes = numberArg(call.args.delayMinutes ?? call.args.delay_minutes, 1, 10080, 15);
     const now = Date.now();
-    saveTimedWakeSchedule({
+    const schedule = {
         id: makeTimedWakeId(context.sessionId),
         sessionId: context.sessionId,
         characterId: context.characterId,
@@ -2666,7 +3012,10 @@ async function executeTimedWakeTool(call: ToolCall, context?: ToolExecutionConte
         fireAt: now + delayMinutes * 60 * 1000,
         delayMinutes,
         intent,
-    });
+    };
+    saveTimedWakeSchedule(schedule);
+    // 离线推送兜底：到点时 App 被杀也能由服务端接管生成（动态引入避免模块环）
+    void import("./push-bailout-client").then(m => m.armTimedWakeBailout(schedule)).catch(() => undefined);
 
     return {
         name: "稍后主动联系",
@@ -3307,6 +3656,7 @@ async function mcpRequest(
     isNotification?: boolean,
     useSse?: boolean,
     signal?: AbortSignal,
+    directFetch?: boolean,
 ): Promise<{ result?: unknown; error?: { code: number; message: string }; headers: Record<string, string> }> {
     throwIfAborted(signal);
     const headers: Record<string, string> = {
@@ -3326,12 +3676,20 @@ async function mcpRequest(
     // SSE transport: use SSE_REQUEST which handles the full SSE flow
     const proxyMethod = useSse ? "SSE_REQUEST" : "POST";
 
-    const res = await proxyFetch(serverUrl, {
-        method: proxyMethod,
-        headers,
-        body,
-        signal,
-    });
+    let res: { status: number; text: string; headers: Record<string, string> };
+    if (directFetch) {
+        if (useSse) {
+            return { error: { code: -1, message: "直连模式暂不支持 SSE 传输的 MCP。请改用 Streamable HTTP 地址（通常以 /mcp 结尾），或关闭该服务器的直连模式。" }, headers: {} };
+        }
+        res = await directMcpFetch(serverUrl, { headers, body, signal });
+    } else {
+        res = await proxyFetch(serverUrl, {
+            method: proxyMethod,
+            headers,
+            body,
+            signal,
+        });
+    }
 
     if (res.status === 401) {
         // 把响应体带回去：401 可能来自应用登录网关、隧道/反代或 MCP 服务器本身，
@@ -3402,7 +3760,7 @@ async function mcpInitialize(server: McpServerConfig, signal?: AbortSignal): Pro
         protocolVersion: MCP_PROTOCOL_VERSION,
         capabilities: {},
         clientInfo: MCP_CLIENT_INFO,
-    }, authHeaders, false, useSse, signal);
+    }, authHeaders, false, useSse, signal, server.directFetch);
 
     // Handle 401 — 按来源分流：应用登录网关 / 真 OAuth 服务器 / Token 失效
     if (initRes.error?.code === 401) {
@@ -3424,7 +3782,7 @@ async function mcpInitialize(server: McpServerConfig, signal?: AbortSignal): Pro
     await mcpRequest(requestUrl, "notifications/initialized", {}, {
         ...authHeaders,
         ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
-    }, true, useSse, signal);
+    }, true, useSse, signal, server.directFetch);
 
     return { success: true };
 }
@@ -3443,7 +3801,7 @@ async function ensureTokenFresh(server: McpServerConfig, signal?: AbortSignal): 
                 protocolVersion: MCP_PROTOCOL_VERSION,
                 capabilities: {},
                 clientInfo: MCP_CLIENT_INFO,
-            }, undefined, false, undefined, signal);
+            }, undefined, false, undefined, signal, server.directFetch);
             const resolved = await resolveMcpOAuthMetadata(server.url, probe.headers["www-authenticate"] || "", signal);
             tokenEndpoint = resolved.metadata.token_endpoint;
             server.oauthTokenEndpoint = tokenEndpoint;
@@ -3808,7 +4166,7 @@ async function executeMcpTool(server: McpServerConfig, toolName: string, args: R
         const res = await mcpRequest(requestUrl, "tools/call", {
             name: toolName,
             arguments: args,
-        }, getMcpSessionHeaders(server), false, useSse, signal);
+        }, getMcpSessionHeaders(server), false, useSse, signal, server.directFetch);
 
         // Session expired — retry once
         if (res.error?.code === 401 || res.error?.code === 404) {
@@ -3822,7 +4180,7 @@ async function executeMcpTool(server: McpServerConfig, toolName: string, args: R
             const retry = await mcpRequest(server.url, "tools/call", {
                 name: toolName,
                 arguments: args,
-            }, getMcpSessionHeaders(server), false, useSse, signal);
+            }, getMcpSessionHeaders(server), false, useSse, signal, server.directFetch);
 
             if (retry.error) {
                 return { name: toolName, success: false, error: retry.error.message };
@@ -3890,7 +4248,7 @@ export async function discoverMcpTools(serverUrl: string, server?: McpServerConf
     const headers = server ? getMcpSessionHeaders(server) : { "MCP-Protocol-Version": MCP_PROTOCOL_VERSION };
 
     const useSse = isSseUrl(serverUrl);
-    const res = await mcpRequest(serverUrl, "tools/list", {}, headers, false, useSse);
+    const res = await mcpRequest(serverUrl, "tools/list", {}, headers, false, useSse, undefined, server?.directFetch);
 
     if (res.error) throw new Error(res.error.message);
 

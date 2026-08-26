@@ -36,7 +36,9 @@ import {
   mdiDatabase,
   mdiAccount,
   mdiHome,
+  mdiBridge,
   mdiHammerWrench,
+  mdiGlassCocktail,
   mdiStorefrontOutline,
 } from "@mdi/js";
 
@@ -64,6 +66,7 @@ const MDI_PATHS: Record<IconId, string> = {
   mapmode: mdiMapMarker,
   worldbuilder: mdiEarth,
   qa: mdiHammerWrench,
+  mixology: mdiGlassCocktail,
   vnplay: mdiPlayCircle,
   vnchapters: mdiBookmark,
   moments: mdiCamera,
@@ -73,6 +76,7 @@ const MDI_PATHS: Record<IconId, string> = {
   resource_hub: mdiStorefrontOutline,
   characters: mdiAccount,
   dwelling: mdiHome,
+  realitybridge: mdiBridge,
 };
 
 export function IconGlyph({ id, className }: IconGlyphProps) {

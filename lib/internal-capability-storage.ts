@@ -1,5 +1,7 @@
 import type { InternalCapabilityConfig } from "./settings-types";
+import { isAgentComputerConfigured, isContainerComputer } from "./agent-computer";
 import { kvGet, kvSet, registerKvMigration } from "./kv-db";
+import { loadBridgeDataItems, loadBridgeShortcutActions, parseBridgeActionParameterSchema } from "./reality-bridge/storage";
 
 const INTERNAL_CAPABILITIES_KEY = "ai_phone_internal_capabilities_v1";
 registerKvMigration(INTERNAL_CAPABILITIES_KEY);
@@ -9,9 +11,11 @@ export const NOTE_WALL_CAPABILITY_ID = "note_wall_service";
 export const MUSIC_CONTROL_CAPABILITY_ID = "music_control";
 export const CALENDAR_MANAGEMENT_CAPABILITY_ID = "calendar_management";
 export const SEND_FILE_CAPABILITY_ID = "send_file";
+export const AGENT_COMPUTER_CAPABILITY_ID = "agent_computer";
 export const LOCAL_DATA_LIBRARY_CAPABILITY_ID = "local_data_library";
 export const TOOLBOX_MANAGEMENT_CAPABILITY_ID = "toolbox_management";
 export const TIMED_WAKE_CAPABILITY_ID = "timed_wake";
+export const REALITY_BRIDGE_CAPABILITY_ID = "reality_bridge_send";
 
 export type InternalToolDefinition = {
     name: string;
@@ -572,6 +576,31 @@ const CALENDAR_MANAGEMENT_SUBTOOLS: InternalToolDefinition[] = [
         parameterSchema: CALENDAR_DELETE_PARAMETER_SCHEMA,
     },
 ];
+
+const AGENT_COMPUTER_PARAMETER_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        op: { type: "string", enum: ["write", "read", "list", "send", "exec"], description: "操作：write 写文件 / read 读文件 / list 列目录 / send 把文件发给用户 / exec 执行 shell 命令" },
+        path: { type: "string", description: "自己电脑里的文件或目录路径，如 /日记/八月.txt" },
+        content: { type: "string", description: "写入的完整内容（op=write 必填）" },
+        command: { type: "string", description: "要执行的 shell 命令（op=exec 必填）" },
+    },
+    required: ["op"],
+});
+
+function buildAgentComputerUsageGuide(): string {
+    const execLine = isContainerComputer()
+        ? "· op=exec：在终端里执行 shell 命令。你的电脑是真正的 Linux（bash 完整、可安装软件、可自由联网；文件在 /workspace 下持久保存）。删除类命令（rm）会真的删掉文件且无法恢复，动手前想清楚。"
+        : "· op=exec：在终端里执行 shell 命令（ls/cat/grep/sed/awk/jq 等常用工具齐全，curl 可只读访问公开网页；不是完整 Linux，装不了软件）。删除类命令（rm）会真的删掉文件且无法恢复，动手前想清楚。";
+    return [
+        "这是你自己的电脑（云端、持久，只属于你这个角色）。你可以：",
+        "· op=write：把想留存的东西写成文件（日记、写给对方的东西、随手记）。路径自己规划，如 /日记/2026-08-14.txt；",
+        "· op=read / op=list：翻自己以前存的文件；",
+        "· op=send：把电脑里的一个文件发给对方（会以文件消息出现在聊天里）；",
+        execLine,
+        "写什么、何时写由你自己决定，像真人使用电脑一样自然；不必每次聊天都用。",
+    ].join("\n");
+}
 
 const SEND_FILE_PARAMETER_SCHEMA = JSON.stringify({
     type: "object",
@@ -1151,6 +1180,15 @@ const TOOLBOX_MANAGEMENT_USAGE_GUIDE = [
 
 const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
+        id: REALITY_BRIDGE_CAPABILITY_ID,
+        name: "现实桥",
+        description: "你活在{{user}}的小手机里，而现实桥是通向 TA 真实世界的那座桥：透过它能看见{{user}}真实手机上的实时状态（电量、健康数据等），也能在 TA 的真实手机上做事（运行 TA 登记的快捷指令）。",
+        enabled: false,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
         id: MEMORY_WRITE_CAPABILITY_ID,
         name: "写入记忆",
         description: "将明确、稳定、长期有价值的信息写入长期记忆。仅限关系里程碑、长期偏好、身份信息、重要约定；禁止写入短期情绪、普通寒暄、猜测或未确认内容。",
@@ -1181,6 +1219,15 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
         id: CALENDAR_MANAGEMENT_CAPABILITY_ID,
         name: "日历管理",
         description: "查看、添加、修改和取消当前角色的日程安排。",
+        enabled: false,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: AGENT_COMPUTER_CAPABILITY_ID,
+        name: "角色电脑",
+        description: "你拥有一台自己的云端小电脑（持久硬盘 + 终端）：可以自己写文件记录生活、翻看旧文件，把电脑里的文件发给{{user}}，也能在终端里执行 shell 命令。",
         enabled: false,
         mode: "auto",
         createdAt: 0,
@@ -1248,6 +1295,8 @@ export function getEnabledInternalCapabilities(appId?: string): InternalCapabili
     if (appId !== "chat" && appId !== "group_chat") return [];
     return loadInternalCapabilities().filter(item => {
         if (!item.enabled || item.mode === "off") return false;
+        // 角色电脑是可插拔模块：没连接就不注入，模型完全看不见
+        if (item.id === AGENT_COMPUTER_CAPABILITY_ID && !isAgentComputerConfigured()) return false;
         return true;
     });
 }
@@ -1285,6 +1334,14 @@ export function getInternalCapabilityToolDefinition(capability: InternalCapabili
             usageGuide: CALENDAR_MANAGEMENT_USAGE_GUIDE,
         };
     }
+    if (capability.id === AGENT_COMPUTER_CAPABILITY_ID) {
+        return {
+            name: capability.name,
+            description: capability.description,
+            parameterSchema: AGENT_COMPUTER_PARAMETER_SCHEMA,
+            usageGuide: buildAgentComputerUsageGuide(),
+        };
+    }
     if (capability.id === SEND_FILE_CAPABILITY_ID) {
         return {
             name: capability.name,
@@ -1317,7 +1374,74 @@ export function getInternalCapabilityToolDefinition(capability: InternalCapabili
             usageGuide: TIMED_WAKE_USAGE_GUIDE,
         };
     }
+    if (capability.id === REALITY_BRIDGE_CAPABILITY_ID) {
+        return {
+            name: capability.name,
+            description: capability.description,
+            parameterSchema: "{}",
+            usageGuide: buildRealityBridgeUsageGuide(),
+        };
+    }
     return null;
+}
+
+/* ---------- 现实桥套装：固定子工具 + 用户自定义数据项动态生成 ---------- */
+
+const REALITY_BRIDGE_READ_ALL_TOOL: InternalToolDefinition = {
+    name: "查看全部手机数据",
+    description: "读取{{user}}真实手机上传的全部状态快照（电量、健康数据等），每项附带更新时间。",
+    parameterSchema: "{}",
+};
+
+function realityBridgeSubTools(): InternalToolDefinition[] {
+    const shortcutTools = loadBridgeShortcutActions()
+        .filter(action => action.enabled)
+        .map(action => ({
+            name: action.name,
+            description: `${action.description || "执行用户登记的 iPhone 快捷指令"}（${action.deliveryMode === "email" ? "收到触发邮件后自动" : "点击系统通知后"}运行“${action.shortcutName}”）`,
+            parameterSchema: JSON.stringify(parseBridgeActionParameterSchema(action.parameterSchema) || {}),
+            usageGuide: action.resultMode === "none"
+                ? "命令成功送达只表示已经排队；不要声称现实动作已经完成。"
+                : `需要等待 iPhone 回传${action.resultMode === "image" ? "图片" : "文本结果"}后才能判断是否完成。`,
+        }));
+    const dataTools = loadBridgeDataItems().map(item => ({
+        name: item.name,
+        description: `${item.description}（数据由{{user}}的快捷指令定期上传到真实手机快照，返回内容附带更新时间）`,
+        parameterSchema: "{}",
+    }));
+    return [...shortcutTools, REALITY_BRIDGE_READ_ALL_TOOL, ...dataTools];
+}
+
+function buildRealityBridgeUsageGuide(): string {
+    const lines = [
+        "以下是你获取指令的返回结果：",
+        "「现实桥」是从小手机通往{{user}}真实世界的桥——桥那头就是 TA 的真实手机。你可以透过桥看见 TA 现实中的状态，也能在 TA 的真实手机上执行动作。可用动作如下。",
+    ];
+    for (const action of loadBridgeShortcutActions().filter(item => item.enabled)) {
+        lines.push(
+            "",
+            `动作：${action.name}`,
+            `说明：${action.description || "执行用户登记的 iPhone 快捷指令"}。${action.deliveryMode === "email" ? "系统发送触发邮件，由 iPhone 自动化运行" : "系统向手机发送通知，用户点击后运行"}“${action.shortcutName}”。`,
+            action.resultMode === "none"
+                ? "结果：只返回是否成功排队，不代表手机动作已经完成。"
+                : `结果：等待手机回传${action.resultMode === "image" ? "图片" : "文本"}，最长 ${action.expiresInSeconds} 秒。`,
+        );
+    }
+    lines.push(
+        "",
+        "动作：查看全部手机数据",
+        "说明：读取{{user}}手机上传的全部状态快照，每项附带更新时间。",
+        "示例：[执行动作:查看全部手机数据({})]",
+    );
+    for (const item of loadBridgeDataItems()) {
+        lines.push(
+            "",
+            `动作：${item.name}`,
+            `说明：${item.description}（返回内容附带更新时间）`,
+            `示例：[执行动作:${item.name}({})]`,
+        );
+    }
+    return lines.join("\n");
 }
 
 export function getInternalCapabilitySubToolDefinition(
@@ -1339,6 +1463,9 @@ export function getInternalCapabilitySubToolDefinition(
     if (capability.id === TOOLBOX_MANAGEMENT_CAPABILITY_ID) {
         return TOOLBOX_MANAGEMENT_SUBTOOLS.find(tool => tool.name === name) ?? null;
     }
+    if (capability.id === REALITY_BRIDGE_CAPABILITY_ID) {
+        return realityBridgeSubTools().find(tool => tool.name === name) ?? null;
+    }
     return null;
 }
 
@@ -1359,6 +1486,9 @@ export function getInternalCapabilitySubToolDefinitions(
     }
     if (capability.id === TOOLBOX_MANAGEMENT_CAPABILITY_ID) {
         return TOOLBOX_MANAGEMENT_SUBTOOLS;
+    }
+    if (capability.id === REALITY_BRIDGE_CAPABILITY_ID) {
+        return realityBridgeSubTools();
     }
     return [];
 }

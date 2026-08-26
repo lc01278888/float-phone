@@ -1,6 +1,7 @@
 // lib/chat-engine.ts
 
 import { createSseJsonParser } from "./sse-json";
+import { maybeAppendShortcutCapability } from "./offline-shortcut-capability";
 import { loadCharacters } from "./character-storage";
 import { buildScreenEffectPromptHint } from "./chat-screen-effects";
 import { emitChatPluginEvent, runChatPluginTransform } from "./chat-plugin-hooks";
@@ -12,6 +13,7 @@ import {
     ChatMessage,
     loadFollowUpSchedule,
     loadChatAppSettings,
+    getMaxToolRounds,
     loadChatSessions,
     saveChatSessions,
     getLatestCharacterStateValues,
@@ -33,6 +35,7 @@ import {
 } from "./settings-storage";
 import { assemblePromptPayload, applyOutputRegex, type LLMMessage, type LLMContentPart } from "./llm-prompt-assembler";
 import { MacroEngine, postProcessTrim } from "./macro-engine";
+import { getStatusRegionConfig, resolveStatusRegionSection, resolveStatusRegionExampleLine, resolveStatusRegionComposition, resolveStatusRegionFullExample } from "./chat-status-region";
 import {
     buildProviderDebugMessages,
     buildProviderRequest,
@@ -82,6 +85,7 @@ import {
 } from "./bilingual-prompt-defaults";
 import { parseOfflineResponse, type ParsedOfflineResponse } from "./chat-offline-storage";
 import { throwIfAborted } from "./abort-utils";
+import { armShortcutContinuation, type ShortcutContinuationHandle, type ShortcutContinuationStyle } from "./shortcut-continuation-client";
 
 
 
@@ -242,6 +246,16 @@ async function resolveVisionImageRefForApi(imageRef: string): Promise<VisionImag
             return staticDataUrl ? { url: staticDataUrl } : { drop: true };
         }
         return { url: await readCompressedImageDataUrl(blob) };
+    }
+
+    try {
+        const parsed = new URL(imageRef);
+        const isLegacyShortcutMedia = parsed.pathname === "/api/push/shortcut-commands/media";
+        const isShortcutResultMedia = parsed.pathname.endsWith("/functions/v1/push-shortcut-result")
+            && parsed.searchParams.get("download") === "1";
+        if (isLegacyShortcutMedia || isShortcutResultMedia) return { drop: true };
+    } catch {
+        // 非 URL 引用继续交给下方的常规判断。
     }
 
     if (isLikelyGifImageRef(imageRef)) {
@@ -690,6 +704,7 @@ async function readSseStream(
     response: Response,
     providerKind: ChatCompletionStreamResult["providerKind"],
     callbacks?: ChatCompletionStreamCallbacks,
+    stripTimestamps = true,
 ): Promise<{ content: string; rawResponse: string }> {
     if (!response.body) throw new ChatEngineError("流式响应没有 body。");
     const reader = response.body.getReader();
@@ -697,7 +712,12 @@ async function readSseStream(
     let buffer = "";
     let content = "";
     let rawResponse = "";
-    const contentStripper = createStreamingTimestampStripper();
+    // 时间戳剥离器会一直扣住流尾巴的 64 个字符等括号闭合，流结束才吐出来。
+    // 要求"所见即模型所写"的调用方（独家特调）把它整个关掉：增量来一个字出一个字，
+    // 否则模型在末尾写机括标记行（〔记〕这类）时，整行都压在扣留窗里，看起来像卡死。
+    const contentStripper = stripTimestamps
+        ? createStreamingTimestampStripper()
+        : { push: (text: string) => text, flush: () => "" };
 
     // 容错解析：中转把长 JSON 行切开时做碎片重组，不再静默丢增量（见 sse-json.ts）
     const sseParser = createSseJsonParser();
@@ -755,6 +775,8 @@ export async function sendLLMStreamRequest(
     meta?: { characterName?: string; userName?: string },
     options?: {
         skipOutputRegex?: boolean;
+        /** 不剥幻觉时间戳：流式增量原样直出（不扣尾巴），落库文本与流出的一字不差 */
+        skipTimestampStrip?: boolean;
         includeReasoning?: boolean;
         appId?: string;
         appTags?: string[];
@@ -792,11 +814,11 @@ export async function sendLLMStreamRequest(
             const errorText = await response.text();
             throw new ChatEngineError(`API Stream Error ${response.status}: ${errorText}`);
         }
-        const { content: streamedContent, rawResponse } = await readSseStream(response, request.providerKind, pluginCallbacks ?? callbacks);
+        const { content: streamedContent, rawResponse } = await readSseStream(response, request.providerKind, pluginCallbacks ?? callbacks, !options?.skipTimestampStrip);
         if (!streamedContent.trim()) {
             throw new ChatEngineError("流式响应没有解析到文本增量。");
         }
-        let rawOutput = stripHallucinatedTimestamps(streamedContent.trim());
+        let rawOutput = options?.skipTimestampStrip ? streamedContent.trim() : stripHallucinatedTimestamps(streamedContent.trim());
         rawOutput = await applyChatPluginLlmResponse(rawOutput, pluginPurpose);
 
         // Store API log entry — mirror sendLLMRequest so streaming calls also show up
@@ -1261,6 +1283,8 @@ export async function sendLLMToolRequest(
         }
         rawOutput = await applyChatPluginLlmResponse(rawOutput, pluginPurpose, options?.debugSessionId);
 
+        rawOutput = await applyChatPluginLlmResponse(rawOutput, pluginPurpose, options?.debugSessionId);
+
         if (!rawOutput && parsed.toolCalls.length === 0) {
             const emptyDetails = emptyResponseDetails(parsed.raw);
             console.warn("[ChatEngine] Empty native tool response from API!", {
@@ -1440,12 +1464,12 @@ export type ChatCompletionResult = {
     parts: ChatCompletionPart[];
 };
 
-/** Extract combined clean text from a ChatCompletionResult (for callers that need a plain string) */
+/** Extract combined clean text from a ChatCompletionResult (for callers that need a plain string). */
 export function flattenCompletionResult(result: ChatCompletionResult): string {
     return result.parts.map(p => stripTextToolDirectives(p.text)).filter(Boolean).join("\n\n");
 }
 
-const MAX_TOOL_ROUNDS = 5;
+// 单条消息工具循环轮数上限：设置项（聊天工具箱），默认 5
 const MAX_NATIVE_EXPANDED_TOOL_PACKAGES = 2;
 
 export function buildChatBilingualInstruction(
@@ -1873,6 +1897,8 @@ export async function buildChatPromptMessages(
     const chatBilingualInstruction = !session.isGroup
         ? buildChatBilingualInstruction(session.bilingualTranslationEnabled !== false, "single", session.bilingualTranslationPrompt)
         : "";
+    // 状态区宏：按会话配置解析（native=原文/off=空/custom=契约）；群聊条目不含宏，不受影响
+    const statusRegionCfg = getStatusRegionConfig(session.id);
     const offlineBilingualInstruction = !session.isGroup
         ? buildOfflineBilingualInstruction(
             session.bilingualTranslationEnabled !== false,
@@ -1916,6 +1942,10 @@ export async function buildChatPromptMessages(
         tools: toolsPrompt,
         customAppRichMediaDirectives,
         chatBilingualInstruction,
+        statusRegionSection: resolveStatusRegionSection(statusRegionCfg),
+        statusRegionExampleLine: resolveStatusRegionExampleLine(statusRegionCfg),
+        statusRegionComposition: resolveStatusRegionComposition(statusRegionCfg),
+        statusRegionFullExample: resolveStatusRegionFullExample(statusRegionCfg),
         offlineBilingualInstruction,
         offlineSummaryTag: preset?.story_summary_tag?.trim() || "summary",
         nativeToolHistory: usesNativeActions,
@@ -1948,14 +1978,14 @@ export type ChatCompletionCallbacks = {
     }) => void | Promise<void>;
     onToolNotice?: (notice: string) => void;
     onToolResult?: (content: string, options?: { toolExecutionId?: string }) => void;
+    /** 每轮 LLM 调用解析出思维链（reasoning）时触发，先于该轮 onTextPart */
+    onReasoning?: (text: string) => void;
     onToolAssistantTurn?: (content: string, options?: {
         responseBatchId?: string;
         responseRoundId?: string;
         senderCharacterId?: string;
         senderName?: string;
     }) => void;
-    /** 每轮 LLM 调用解析出思维链（reasoning）时触发，先于该轮 onTextPart */
-    onReasoning?: (text: string) => void;
     onToolExecution?: (results: ToolResult[], historyContent?: string, options?: { toolExecutionId?: string }) => void;
     onNativeToolAssistantTurn?: (turn: {
         content: string;
@@ -2022,9 +2052,10 @@ async function generateNativeChatCompletion(
         userIdentity: ReturnType<typeof resolveUserIdentity>;
         options?: ChatPromptBuildOptions & { signal?: AbortSignal };
         callbacks?: ChatCompletionCallbacks;
+        bailoutRef: ReplyBailoutRef;
     },
 ): Promise<ChatCompletionResult> {
-    const { session, llmMessages, character, config, preset, regexes, userIdentity, options, callbacks } = params;
+    const { session, llmMessages, character, config, preset, regexes, userIdentity, options, callbacks, bailoutRef } = params;
     const enabledTools = getEnabledTools(options?.appId ?? "chat");
     const requestAppTags = mergeAppTags(options?.appTags, options?.promptProfile?.appTags, options?.appId ?? "chat");
     const persistedSession = loadChatSessions().find(item => item.id === session.id);
@@ -2043,7 +2074,8 @@ async function generateNativeChatCompletion(
     const actionContext = { characterId: session.contactId, sessionId: session.id, sourceEngine: "chat" as const, signal: options?.signal };
     const expandableSourceKeys = new Set(enabledTools.filter(tool => !isNativeSingleTool(tool)).map(nativeToolSourceKey));
 
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+    const maxToolRounds = getMaxToolRounds();
+    for (let round = 0; round < maxToolRounds; round += 1) {
         let result: LLMToolRequestResult;
         try {
             result = await sendLLMToolRequest(
@@ -2086,6 +2118,7 @@ async function generateNativeChatCompletion(
             if (result.reasoning) callbacks?.onReasoning?.(result.reasoning);
             await callbacks?.onTextPart?.(afterActionStrip);
             parts.push({ text: afterActionStrip });
+            if (bailoutRef.shortcutHandles.length > 0) bailoutRef.shortcutCompleted = true;
             break;
         }
 
@@ -2116,12 +2149,51 @@ async function generateNativeChatCompletion(
         let realResults: Awaited<ReturnType<typeof executeToolCalls>> = [];
         try {
             if (textCalls.length > 0) {
+                const onlyNativeCall = result.toolCalls.length === 1 && textCalls.length === 1
+                    ? result.toolCalls[0]
+                    : undefined;
                 realResults = await executeToolCalls(textCalls, {
                     appId: options?.appId ?? "chat",
                     sessionId: session.id,
                     characterId: session.contactId,
                     sourceEngine: "chat",
                     signal: options?.signal,
+                    onShortcutCommandCreated: onlyNativeCall ? async command => {
+                        const resultMarker = `__FLOAT_SHORTCUT_RESULT_${command.id}__`;
+                        const imageMarker = command.resultMode === "image" && config.enableImageRecognition
+                            ? `__FLOAT_SHORTCUT_IMAGE_${command.id}__`
+                            : undefined;
+                        const snapshotMessages: LlmRequestMessage[] = [
+                            ...requestMessages,
+                            {
+                                role: "assistant",
+                                content: assistantForToolContext,
+                                reasoning: result.reasoning,
+                                openRouterReasoningDetails: result.openRouterReasoningDetails,
+                                toolCalls: result.toolCalls,
+                            },
+                            {
+                                role: "tool",
+                                name: onlyNativeCall.name,
+                                toolCallId: onlyNativeCall.id,
+                                content: resultMarker,
+                            },
+                            ...(imageMarker ? [{ role: "user" as const, content: imageMarker }] : []),
+                        ];
+                        return registerShortcutContinuation(bailoutRef, {
+                            command,
+                            style: "native",
+                            resultMarker,
+                            imageMarker,
+                            request: buildProviderRequest(config, preset, snapshotMessages),
+                            session,
+                            character,
+                            userName: userIdentity?.name,
+                            regexes,
+                            appId: options?.appId,
+                            appTags: requestAppTags,
+                        });
+                    } : undefined,
                 });
             }
             throwIfAborted(options?.signal);
@@ -2258,14 +2330,139 @@ async function generateNativeChatCompletion(
     return { parts };
 }
 
+type ReplyBailoutRef = {
+    current: { settle: () => void } | null;
+    closed: boolean;
+    superseded: boolean;
+    shortcutHandles: ShortcutContinuationHandle[];
+    shortcutCompleted: boolean;
+    shortcutCancelled: boolean;
+};
+
+async function registerShortcutContinuation(
+    bailoutRef: ReplyBailoutRef,
+    input: {
+        command: { id: string; actionName: string; resultMode: "none" | "text" | "image" };
+        style: ShortcutContinuationStyle;
+        resultMarker: string;
+        imageMarker?: string;
+        request: ReturnType<typeof buildProviderRequest>;
+        session: ChatSession;
+        character: Character;
+        userName?: string;
+        regexes: RegexConfig[];
+        appId?: string;
+        appTags?: string[];
+    },
+): Promise<boolean> {
+    const handle = await armShortcutContinuation({
+        commandId: input.command.id,
+        actionName: input.command.actionName,
+        resultMode: input.command.resultMode,
+        resultMarker: input.resultMarker,
+        imageMarker: input.imageMarker,
+        style: input.style,
+        request: input.request,
+        sessionId: input.session.id,
+        characterName: input.character.name,
+        userName: input.userName,
+        regexes: input.regexes,
+        appId: input.appId,
+        appTags: input.appTags,
+    });
+    if (!handle) return false;
+
+    bailoutRef.superseded = true;
+    bailoutRef.current?.settle();
+    bailoutRef.current = null;
+    bailoutRef.shortcutHandles.push(handle);
+    return true;
+}
+
 export async function generateChatCompletion(
     session: ChatSession,
     history: ChatMessage[],
     options?: ChatPromptBuildOptions & { signal?: AbortSignal },
     callbacks?: ChatCompletionCallbacks,
 ): Promise<ChatCompletionResult> {
+    // 发送兜底（离线推送）：生成期间在服务端挂一张带心跳租约的保险单，
+    // 本地完成即撤销；App 被杀则心跳停跳，服务端接管生成并推送。
+    const bailoutRef: ReplyBailoutRef = {
+        current: null,
+        closed: false,
+        superseded: false,
+        shortcutHandles: [],
+        shortcutCompleted: false,
+        shortcutCancelled: false,
+    };
+    try {
+        return await generateChatCompletionCore(session, history, options, callbacks, bailoutRef);
+    } catch (err) {
+        if (options?.signal?.aborted) bailoutRef.shortcutCancelled = true;
+        throw err;
+    } finally {
+        bailoutRef.closed = true;
+        bailoutRef.current?.settle();
+        for (const handle of bailoutRef.shortcutHandles) {
+            if (bailoutRef.shortcutCompleted || bailoutRef.shortcutCancelled) handle.settle();
+            else handle.release();
+        }
+    }
+}
+
+async function generateChatCompletionCore(
+    session: ChatSession,
+    history: ChatMessage[],
+    options: (ChatPromptBuildOptions & { signal?: AbortSignal }) | undefined,
+    callbacks: ChatCompletionCallbacks | undefined,
+    bailoutRef: ReplyBailoutRef,
+): Promise<ChatCompletionResult> {
     const { llmMessages, character, config, preset, regexes, userIdentity, toolsEnabled } = await buildChatPromptMessages(session, history, options);
     const requestAppTags = mergeAppTags(options?.appTags, options?.promptProfile?.appTags, options?.appId ?? "chat");
+
+    // 追问有自己的排期时兜底（followup:key），这里只为普通回复生成挂单。
+    // 不 await：挂单失败或慢都不拖累本地生成；生成先结束则通过 closed 标记补撤销。
+    if (!session.isGroup && (options?.appId ?? "chat") === "chat" && !(requestAppTags ?? []).includes("followup")) {
+        // 云端兜底可能在另一台机器上生成并经真实微信发送。把本轮最后一条
+        // 用户输入/系统指令作为因果锚点带过去，避免回复拉回本地后因手机与
+        // 云服务器存在亚秒级时钟偏差，被按 createdAt 重排到触发消息前面。
+        const replyAfterMessage = [...history].reverse().find(message =>
+            message.sessionId === session.id
+            && (message.role === "user" || message.mediaType === "system_instruction")
+            && Boolean(message.id)
+            && Boolean(message.createdAt),
+        );
+        // 消息数组必须同步定格：下面的工具循环会往 llmMessages 里 splice 中间轮次，
+        // 等动态 import 的微任务跑到时数组早就不是这一轮的原样了。组装请求本身
+        // 留在微任务里，别把这条热路径上的回复往后拖。
+        // 顺带注入快捷动作目录——服务端接管生成时执行不了本地工具循环，但
+        // 标记式【快捷动作：名称】push-generate 是认的，不注入角色就只会说"我没有工具"。
+        //
+        // 这里刻意不挂「结果续跑」快照：普通回复兜底是每条消息都要挂一次的，
+        // 续跑快照会把上传体积翻倍（两份完整提示词），提示词大时会撞上服务端
+        // 900KB 上限（app/api/push/jobs/route.ts），一撞就是整条兜底挂不上、
+        // 静默丢掉离线回复——为了第二轮续跑赔掉第一轮，不划算。冷场重连与定时
+        // 唤醒是低频任务，那两条照常挂续跑。
+        const bailoutMessages = [...llmMessages];
+        // 这条路径不挂续跑（见上），所以也不能向角色承诺第二轮
+        maybeAppendShortcutCapability(bailoutMessages, { continuationAvailable: false });
+        void import("./push-bailout-client").then(async mod => {
+            const handle = await mod.armReplyBailout({
+                sessionId: session.id,
+                characterName: character.name,
+                userName: userIdentity?.name,
+                regexes,
+                request: buildProviderRequest(config, preset, toLlmRequestMessages(bailoutMessages)),
+                replyAfter: replyAfterMessage
+                    ? { localMessageId: replyAfterMessage.id, createdAt: replyAfterMessage.createdAt }
+                    : undefined,
+                signal: options?.signal,
+            });
+            if (!handle) return;
+            if (bailoutRef.closed || bailoutRef.superseded) handle.settle();
+            else bailoutRef.current = handle;
+        }).catch(() => undefined);
+    }
 
     if (toolsEnabled && nativeToolProtocolForConfig(config) && getEnabledTools(options?.appId ?? "chat").length > 0) {
         return generateNativeChatCompletion({
@@ -2278,6 +2475,7 @@ export async function generateChatCompletion(
             userIdentity,
             options,
             callbacks,
+            bailoutRef,
         });
     }
 
@@ -2286,7 +2484,8 @@ export async function generateChatCompletion(
     const meta = { characterName: character.name, userName: userIdentity?.name };
     const actionContext = { characterId: session.contactId, sessionId: session.id, sourceEngine: "chat" as const, signal: options?.signal };
 
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const maxToolRounds = getMaxToolRounds();
+    for (let round = 0; round < maxToolRounds; round++) {
         let filteredOutput: string;
         try {
             filteredOutput = await sendLLMRequest(config, preset, llmMessages, regexes, meta, {
@@ -2326,6 +2525,7 @@ export async function generateChatCompletion(
             throwIfAborted(options?.signal);
             await callbacks?.onTextPart?.(afterActionStrip);
             parts.push({ text: afterActionStrip });
+            if (bailoutRef.shortcutHandles.length > 0) bailoutRef.shortcutCompleted = true;
             break;
         }
 
@@ -2390,12 +2590,39 @@ export async function generateChatCompletion(
 
             let results: Awaited<ReturnType<typeof executeToolCalls>>;
             try {
+                const onlyToolCall = toolCalls.length === 1 ? toolCalls[0] : undefined;
                 results = await executeToolCalls(toolCalls, {
                     appId: options?.appId ?? "chat",
                     sessionId: session.id,
                     characterId: session.contactId,
                     sourceEngine: "chat",
                     signal: options?.signal,
+                    onShortcutCommandCreated: onlyToolCall ? async command => {
+                        const resultMarker = `__FLOAT_SHORTCUT_RESULT_${command.id}__`;
+                        const imageMarker = command.resultMode === "image" && config.enableImageRecognition
+                            ? `__FLOAT_SHORTCUT_IMAGE_${command.id}__`
+                            : undefined;
+                        const snapshotMessages = [...llmMessages];
+                        const insertions: LLMMessage[] = [
+                            { role: "assistant", content: assistantForToolContext, _debugMeta: { _fromHistory: true } },
+                            { role: "user", content: resultMarker, _debugMeta: { _fromHistory: true } },
+                            ...(imageMarker ? [{ role: "user" as const, content: imageMarker, _debugMeta: { _fromHistory: true } }] : []),
+                        ];
+                        snapshotMessages.splice(findInsertIdx(), 0, ...insertions);
+                        return registerShortcutContinuation(bailoutRef, {
+                            command,
+                            style: "text",
+                            resultMarker,
+                            imageMarker,
+                            request: buildProviderRequest(config, preset, toLlmRequestMessages(snapshotMessages)),
+                            session,
+                            character,
+                            userName: userIdentity?.name,
+                            regexes,
+                            appId: options?.appId,
+                            appTags: requestAppTags,
+                        });
+                    } : undefined,
                 });
                 throwIfAborted(options?.signal);
                 const resultNotices = results.map(r => r.userNotice || (r.success ? `✓ ${r.name} 执行成功` : `✗ ${r.name}: ${r.error}`)).join("；");
@@ -2452,7 +2679,7 @@ export async function generateChatCompletion(
             }
 
             // Last round — one final call
-            if (round === MAX_TOOL_ROUNDS - 1) {
+            if (round === maxToolRounds - 1) {
                 try {
                     const finalOutput = await sendLLMRequest(config, preset, llmMessages, regexes, meta, {
                         appId: options?.appId ?? "chat",
@@ -2465,6 +2692,7 @@ export async function generateChatCompletion(
                     throwIfAborted(options?.signal);
                     await callbacks?.onTextPart?.(finalOutput);
                     parts.push({ text: finalOutput });
+                    if (bailoutRef.shortcutHandles.length > 0) bailoutRef.shortcutCompleted = true;
                 } catch (err) {
                     throwIfAborted(options?.signal);
                     const errMsg = `⚠️ 回复生成失败: ${err instanceof Error ? err.message : String(err)}`;

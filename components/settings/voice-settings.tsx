@@ -17,6 +17,15 @@ const MINIMAX_BASE_URL_OPTIONS = [
 ];
 const DEFAULT_MINIMAX_BASE_URL = MINIMAX_BASE_URL_OPTIONS[0].baseUrl;
 const GLOBAL_MINIMAX_BASE_URL = MINIMAX_BASE_URL_OPTIONS[1].baseUrl;
+const MINIMAX_SPEED_MIN = 0.5;
+const MINIMAX_SPEED_MAX = 2.0;
+const MINIMAX_SPEED_STEP = 0.1;
+const DEFAULT_SPEECH_SPEED = 1.0;
+// Minimax voice_setting.pitch：半音，官方范围 ±12，0 为原声
+const MINIMAX_PITCH_MIN = -12;
+const MINIMAX_PITCH_MAX = 12;
+const MINIMAX_PITCH_STEP = 1;
+const DEFAULT_SPEECH_PITCH = 0;
 const VOICE_PROVIDER_OPTIONS = [
     { value: "OpenAI", label: "OpenAI TTS" },
     { value: "MinimaxCN", label: "Minimax 语音国内版" },
@@ -32,6 +41,8 @@ const DEFAULT_VOICE_CONFIGS: VoiceApiConfig[] = [
         baseUrl: DEFAULT_MINIMAX_BASE_URL,
         model: "speech-2.8-turbo",
         defaultVoice: "male-qn-qingse",
+        speechSpeed: DEFAULT_SPEECH_SPEED,
+        speechPitch: DEFAULT_SPEECH_PITCH,
         enableSTT: true,
         enableTTS: true,
     }
@@ -190,7 +201,13 @@ function normalizeVoiceConfigs(configs: VoiceApiConfig[]): VoiceApiConfig[] {
             const baseUrl = MINIMAX_BASE_URL_OPTIONS.some(option => option.baseUrl === config.baseUrl)
                 ? config.baseUrl
                 : DEFAULT_MINIMAX_BASE_URL;
-            return { ...config, baseUrl };
+            const speechSpeed = typeof config.speechSpeed === "number" && Number.isFinite(config.speechSpeed)
+                ? Math.min(MINIMAX_SPEED_MAX, Math.max(MINIMAX_SPEED_MIN, config.speechSpeed))
+                : DEFAULT_SPEECH_SPEED;
+            const speechPitch = typeof config.speechPitch === "number" && Number.isFinite(config.speechPitch)
+                ? Math.min(MINIMAX_PITCH_MAX, Math.max(MINIMAX_PITCH_MIN, Math.round(config.speechPitch)))
+                : DEFAULT_SPEECH_PITCH;
+            return { ...config, baseUrl, speechSpeed, speechPitch };
         });
 }
 
@@ -259,6 +276,7 @@ export function VoiceSettings() {
             region: "",
             model: "speech-2.8-turbo",
             defaultVoice: "male-qn-qingse",
+            speechSpeed: DEFAULT_SPEECH_SPEED,
             enableSTT: true,
             enableTTS: true,
         };
@@ -303,6 +321,7 @@ export function VoiceSettings() {
             baseUrl: providerOption === "MinimaxGlobal" ? GLOBAL_MINIMAX_BASE_URL : DEFAULT_MINIMAX_BASE_URL,
             model: wasMinimax ? (current?.model || "speech-2.8-turbo") : "speech-2.8-turbo",
             defaultVoice: wasMinimax ? (current?.defaultVoice || "male-qn-qingse") : "male-qn-qingse",
+            speechSpeed: wasMinimax ? (current?.speechSpeed ?? DEFAULT_SPEECH_SPEED) : DEFAULT_SPEECH_SPEED,
         });
         if (!wasMinimax) {
             setManualModelIds(prev => ({ ...prev, [id]: false }));
@@ -708,12 +727,64 @@ export function VoiceSettings() {
                                                         </select>
                                                     )}
                                                 </div>
+                                                <div className="flex flex-col gap-1">
+                                                    <label className="menu-desc ml-1">识别模型 (STT Model)</label>
+                                                    <Input
+                                                        type="text"
+                                                        value={config.sttModel || ""}
+                                                        onChange={(e) => updateConfig(config.id, { sttModel: e.target.value })}
+                                                        placeholder="whisper-1（留空使用默认）"
+                                                    />
+                                                    <span className="menu-desc ml-1">通话「按住说话」用它把录音转成文字（非 iOS 设备生效），走同一个接口地址与密钥</span>
+                                                </div>
                                             </>
                                         )}
 
                                         {config.provider === "Minimax" && (
                                             <>
                                                 <div className="flex flex-col gap-1">
+                                                    <div className="flex items-center justify-between px-1">
+                                                        <label className="menu-desc">语速 (Speed)</label>
+                                                        <span className="menu-label font-medium">{(config.speechSpeed ?? DEFAULT_SPEECH_SPEED).toFixed(1)}×</span>
+                                                    </div>
+                                                    <input
+                                                        type="range"
+                                                        min={MINIMAX_SPEED_MIN}
+                                                        max={MINIMAX_SPEED_MAX}
+                                                        step={MINIMAX_SPEED_STEP}
+                                                        value={config.speechSpeed ?? DEFAULT_SPEECH_SPEED}
+                                                        onChange={(e) => updateConfig(config.id, { speechSpeed: Number(e.target.value) })}
+                                                        className="w-full accent-black"
+                                                        aria-label="Minimax 语速"
+                                                    />
+                                                    <div className="relative h-4 px-1 text-xs text-gray-500" aria-hidden="true">
+                                                        <span className="absolute left-1 whitespace-nowrap">{MINIMAX_SPEED_MIN.toFixed(1)}×</span>
+                                                        <span className="absolute whitespace-nowrap" style={{ left: "33.333%", transform: "translateX(-50%)" }}>1.0× 默认</span>
+                                                        <span className="absolute right-1 whitespace-nowrap">{MINIMAX_SPEED_MAX.toFixed(1)}×</span>
+                                                    </div>
+                                                </div>
+                                                <div className="flex flex-col gap-1 -mt-1">
+                                                    <div className="flex items-center justify-between px-1">
+                                                        <label className="menu-desc">音调 (Pitch)</label>
+                                                        <span className="menu-label font-medium">{config.speechPitch ?? DEFAULT_SPEECH_PITCH}</span>
+                                                    </div>
+                                                    <input
+                                                        type="range"
+                                                        min={MINIMAX_PITCH_MIN}
+                                                        max={MINIMAX_PITCH_MAX}
+                                                        step={MINIMAX_PITCH_STEP}
+                                                        value={config.speechPitch ?? DEFAULT_SPEECH_PITCH}
+                                                        onChange={(e) => updateConfig(config.id, { speechPitch: Number(e.target.value) })}
+                                                        className="w-full accent-black"
+                                                        aria-label="Minimax 音调"
+                                                    />
+                                                    <div className="relative h-4 px-1 text-xs text-gray-500" aria-hidden="true">
+                                                        <span className="absolute left-1 whitespace-nowrap">{MINIMAX_PITCH_MIN}</span>
+                                                        <span className="absolute whitespace-nowrap" style={{ left: "50%", transform: "translateX(-50%)" }}>0 默认</span>
+                                                        <span className="absolute right-1 whitespace-nowrap">+{MINIMAX_PITCH_MAX}</span>
+                                                    </div>
+                                                </div>
+                                                <div className="flex flex-col gap-1 mt-1">
                                                     <label className="menu-desc ml-1">朗读语言</label>
                                                     <select
                                                         value={config.languageBoost || ""}

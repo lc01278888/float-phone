@@ -27,9 +27,23 @@ export type IconId =
   | "resource_hub"
   | "characters"
   | "worldbuilder"
-  | "qa";
+  | "realitybridge"
+  | "qa"
+  | "mixology";
 
-export type DesktopIconId = IconId | CustomAppIconId;
+// 桌面文件夹：以 folder: 前缀的 id 伪装成图标占一个格子参与拖拽/换页，
+// 内容（名字 + 成员图标）另存 DesktopFolderMap。文件夹不允许进 dock。
+export type FolderIconId = `folder:${string}`;
+
+export function isFolderIconId(id: string): id is FolderIconId {
+  return id.startsWith("folder:");
+}
+
+export function createFolderIconId(): FolderIconId {
+  return `folder:${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+export type DesktopIconId = IconId | CustomAppIconId | FolderIconId;
 
 export type IconPosition = { id: DesktopIconId; row: number; col: number };
 
@@ -55,7 +69,7 @@ export const PAGE_2_DEFAULT: IconId[] = [
 ];
 
 // 第三页默认图标：右半边 2×2 排布（左半边留给日历组件），位置见 createDefaultDesktopIconLayout
-export const PAGE_3_DEFAULT: IconId[] = ["worldbuilder", "qa", "resource_hub"];
+export const PAGE_3_DEFAULT: IconId[] = ["worldbuilder", "qa", "resource_hub", "realitybridge", "mixology"];
 
 export const DOCK_DEFAULT: IconId[] = ["settings", "theme", "resources", "characters"];
 
@@ -90,6 +104,7 @@ export const ICONS: Record<IconId, IconMeta> = {
   vnchapters: { id: "vnchapters", label: "章节", tone: "var(--c-icon-rose)", placeholder: true },
   moments: { id: "moments", label: "\u670B\u53CB\u5708", tone: "var(--c-icon-lilac)", placeholder: false },
   group_chat: { id: "group_chat", label: "\u7FA4\u804A", tone: "var(--c-icon-teal)", placeholder: false },
+  realitybridge: { id: "realitybridge", label: "iOS现实桥", tone: "var(--c-icon-teal)", placeholder: false },
   settings: { id: "settings", label: "设置", tone: "var(--c-icon-slate)", placeholder: false },
   theme: { id: "theme", label: "\u4E3B\u9898", tone: "var(--c-icon-violet)", placeholder: true },
   resources: { id: "resources", label: "\u8D44\u6E90\u5E93", tone: "var(--c-icon-teal)", placeholder: false },
@@ -109,4 +124,5 @@ export const ICONS: Record<IconId, IconMeta> = {
     path: "/world-builder"
   },
   qa: { id: "qa", label: "工坊", tone: "var(--c-icon-qa, #4a505c99)", placeholder: false },
+  mixology: { id: "mixology", label: "独家特调", tone: "var(--c-icon-violet)", placeholder: false },
 };
