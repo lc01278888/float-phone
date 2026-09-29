@@ -11,7 +11,7 @@ on:
         required: false
         type: string
   push:
-    branches: [main]
+    branches: [test]
     paths: ["android-shell/**", ".github/workflows/android-shell.yml"]
     tags: ["v*"]
 
@@ -61,11 +61,11 @@ jobs:
           path: android-shell/app/build/outputs/apk/release/*.apk
 
       - name: Publish installable debug snapshot
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/test'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: debug-latest
-          name: Latest installable debug APK
+          tag_name: debug-test-latest
+          name: Latest installable debug APK (test branch)
           prerelease: true
           make_latest: false
           files: android-shell/app/build/outputs/apk/debug/app-debug.apk
