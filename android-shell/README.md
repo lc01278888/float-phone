@@ -81,7 +81,16 @@ base64 -w0 shell.keystore   # 得到一长串 base64
 ## 更新模型
 
 - **网页功能更新**：零成本。壳加载的是线上站点，Netlify 一部署，壳里即刻生效。
-- **APK 更新**：只有改壳本身（推送逻辑、原生能力）才需要重新构建安装，预期很少。
+- **APK 更新**：App 启动时会检查本仓库最新 GitHub Release；发现新版后可在 App 内下载并调起系统安装器。网页也可调用 `window.AndroidShell.checkForUpdate()` 主动检查。
+
+### 发布可被 App 拉取的 APK
+
+1. 按上文配置正式签名的四个 Secret，并设置仓库变量 `SHELL_SITE_URL`；
+2. 更新代码后创建递增的语义化标签，例如 `v1.0.1`；
+3. 推送标签后，GitHub Actions 会用标签作为 `versionName`，构建签名 APK，并把统一命名的 `float-phone.apk` 发布到 GitHub Releases；
+4. 已安装的旧版会通过 GitHub Releases API 检查、下载并安装这个 APK。Android 首次更新时会要求授权“小手机安装未知应用”。
+
+可用环境变量 `SHELL_UPDATE_API_URL` 指向兼容 GitHub Releases `latest` 响应格式的自建接口；默认值是本仓库的 latest release API。
 
 ## 实现速览
 

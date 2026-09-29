@@ -35,12 +35,12 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         val SITE_URL: String = BuildConfig.SITE_URL
-        const val VERSION = "1.0.0"
         /** 来电接听等场景的站内深链（必须以 SITE_URL 开头，否则忽略） */
         const val EXTRA_OPEN_URL = "open_url"
     }
 
     private lateinit var webView: WebView
+    private lateinit var appUpdater: AppUpdater
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
 
     private val fileChooserLauncher = registerForActivityResult(
@@ -91,6 +91,7 @@ class MainActivity : AppCompatActivity() {
         volumeControlStream = AudioManager.STREAM_MUSIC
 
         webView = WebView(this)
+        appUpdater = AppUpdater(this).also { it.register() }
         setContentView(webView)
 
         webView.settings.apply {
@@ -99,7 +100,7 @@ class MainActivity : AppCompatActivity() {
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
             allowFileAccess = false
-            userAgentString = "$userAgentString FloatShell/$VERSION"
+            userAgentString = "$userAgentString FloatShell/${BuildConfig.VERSION_NAME}"
         }
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, false)
@@ -182,6 +183,7 @@ class MainActivity : AppCompatActivity() {
         // 冷启动带深链（如来电接听）直接加载目标；否则加载首页
         webView.loadUrl(consumeOpenUrl(intent) ?: SITE_URL)
         ensurePushService()
+        appUpdater.check(silent = true)
     }
 
     /** singleTask：App 已在运行时（如全屏来电页接听）通过 onNewIntent 送达深链 */
@@ -211,6 +213,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        appUpdater.unregister()
         CookieManager.getInstance().flush()
         webView.destroy()
         super.onDestroy()
@@ -219,7 +222,11 @@ class MainActivity : AppCompatActivity() {
     /** 暴露给网页的原生桥（网页侧可用 window.AndroidShell 特性检测壳环境）。 */
     inner class ShellBridge {
         @JavascriptInterface
-        fun getVersion(): String = VERSION
+        fun getVersion(): String = BuildConfig.VERSION_NAME
+
+        /** 网页设置页可调用 window.AndroidShell.checkForUpdate() 主动检查原生壳更新。 */
+        @JavascriptInterface
+        fun checkForUpdate() = appUpdater.check(silent = false)
 
         /** 打开本应用的系统设置页（引导用户关电池限制、开自启动）。 */
         @JavascriptInterface
